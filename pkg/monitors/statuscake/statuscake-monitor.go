@@ -26,6 +26,7 @@ import (
 
 var log = logf.Log.WithName("statuscake-monitor")
 var rateLimiter = rate.NewLimiter(5, 1) // Allow 5 requests per second
+var cachedMonitors []models.Monitor
 
 // StatusCakeMonitorService is the service structure for StatusCake
 type StatusCakeMonitorService struct {
@@ -37,17 +38,63 @@ type StatusCakeMonitorService struct {
 }
 
 func (monitor *StatusCakeMonitorService) Equal(oldMonitor models.Monitor, newMonitor models.Monitor) bool {
-	// Since there is a discrepency between the fields in the endpointmonitor CR and the statuscake API
-	// use the tags to define a last updated by tags. This ensures we are not ratelimited by statuscake.
-	oldConf := oldMonitor.Config.(*endpointmonitorv1alpha1.StatusCakeConfig)
-	newConf := newMonitor.Config.(*endpointmonitorv1alpha1.StatusCakeConfig)
-	if oldConf.TestTags != newConf.TestTags {
-		msg := "Found a difference between the old TestTags and new TestTags. Updating the UptimeCheck..."
-		log.Info(msg, "Old Tags", oldConf.TestTags, "New Tags", newConf.TestTags)
-		return false
-	} else {
+	// Quick workaround: If old config is nil, treat them as identical.
+	// Log detailed information for debugging
+
+	// This prevents infinite updates when the old config isn’t populated from the API.
+	if oldMonitor.Config == nil {
+		log.Info("Old monitor config is nil. Treating them as identical to avoid re-updates.")
 		return true
 	}
+
+	// Attempt to cast the config to the StatusCakeConfig type
+	oldConf, okOld := oldMonitor.Config.(*endpointmonitorv1alpha1.StatusCakeConfig)
+	newConf, okNew := newMonitor.Config.(*endpointmonitorv1alpha1.StatusCakeConfig)
+
+	if !okOld || !okNew {
+		log.Error(errors.New("invalid configuration type"), "Failed to cast monitor configurations for comparison")
+		return false
+	}
+
+	// log.Info("Starting monitor comparison",
+	// 	"OldMonitor", fmt.Sprintf("%+v", oldConf),
+	// 	"NewMonitor", fmt.Sprintf("%+v", newConf),
+	// )
+
+	// Collect differences
+	differences := []string{}
+
+	if oldMonitor.Name != newMonitor.Name {
+		differences = append(differences, fmt.Sprintf("Name: %s -> %s", oldMonitor.Name, newMonitor.Name))
+	}
+	if oldConf.TestTags != newConf.TestTags {
+		differences = append(differences, fmt.Sprintf("TestTags: %s -> %s", oldConf.TestTags, newConf.TestTags))
+	}
+	if oldConf.CheckRate != newConf.CheckRate {
+		differences = append(differences, fmt.Sprintf("CheckRate: %d -> %d", oldConf.CheckRate, newConf.CheckRate))
+	}
+	if oldConf.Paused != newConf.Paused {
+		differences = append(differences, fmt.Sprintf("Paused: %t -> %t", oldConf.Paused, newConf.Paused))
+	}
+	if oldConf.ContactGroup != newConf.ContactGroup {
+		differences = append(differences, fmt.Sprintf("ContactGroup: %s -> %s", oldConf.ContactGroup, newConf.ContactGroup))
+	}
+	if oldConf.Regions != newConf.Regions {
+		differences = append(differences, fmt.Sprintf("Regions: %s -> %s", oldConf.Regions, newConf.Regions))
+	}
+	if oldConf.StatusCodes != newConf.StatusCodes {
+		differences = append(differences, fmt.Sprintf("StatusCodes: %s -> %s", oldConf.StatusCodes, newConf.StatusCodes))
+	}
+
+	// If differences exist, log them and return false
+	if len(differences) > 0 {
+		log.Info("Monitor differences detected", "Differences", differences)
+		return false
+	}
+
+	// Otherwise, they're identical
+	log.Info("Monitors are identical")
+	return true
 }
 
 // buildUpsertForm function is used to create the form needed to Add or update a monitor
@@ -62,8 +109,10 @@ func buildUpsertForm(m models.Monitor, cgroup string) url.Values {
 
 	if providerConfig != nil && providerConfig.CheckRate > 0 {
 		f.Add("check_rate", strconv.Itoa(providerConfig.CheckRate))
+		log.Info("Using provided CheckRate", "Value", providerConfig.CheckRate)
 	} else {
-		f.Add("check_rate", "300")
+		f.Add("check_rate", "300") // Default value
+		log.Info("Default CheckRate applied", "Value", 300)
 	}
 
 	if providerConfig != nil && len(providerConfig.TestType) > 0 {
@@ -206,12 +255,21 @@ func buildUpsertForm(m models.Monitor, cgroup string) url.Values {
 	if providerConfig != nil {
 		if providerConfig.Paused {
 			f.Add("paused", "1")
+		} else {
+			// Required to unpause
+			f.Add("paused", "0")
 		}
+
 		if providerConfig.FollowRedirect {
 			f.Add("follow_redirects", "1")
+		} else {
+			f.Add("follow_redirects", "0")
 		}
+
 		if providerConfig.EnableSSLAlert {
 			f.Add("enable_ssl_alert", "1")
+		} else {
+			f.Add("enable_ssl_alert", "0")
 		}
 	}
 
@@ -331,38 +389,44 @@ func (service *StatusCakeMonitorService) GetByID(id string) (*models.Monitor, er
 
 // doRequest function to handle requests to StatusCake and handle ratelimits.
 func (service *StatusCakeMonitorService) doRequest(req *http.Request) (*http.Response, error) {
-	// Wait for the rate limiter to allow a request
-	err := rateLimiter.Wait(req.Context())
-	if err != nil {
-		log.Error(err, "Rate limiter wait failed")
-		return nil, err
-	}
+	for attempts := 0; attempts < 3; attempts++ {
+		if err := rateLimiter.Wait(req.Context()); err != nil {
+			log.Error(err, "Rate limiter wait failed")
+			return nil, err
+		}
 
-	resp, err := service.doRequest(req)
-	if err != nil {
-		log.Error(err, "HTTP request failed")
-		return nil, err
-	}
+		resp, err := service.client.Do(req)
+		if err != nil {
+			log.Error(err, "HTTP request failed")
+			return nil, err
+		}
 
-	// Handle rate-limiting responses (HTTP 429)
-	if resp.StatusCode == http.StatusTooManyRequests {
-		retryAfter := resp.Header.Get("Retry-After")
-		if retryAfter != "" {
-			seconds, err := strconv.Atoi(retryAfter)
-			if err == nil {
+		if resp.StatusCode == http.StatusTooManyRequests {
+			retryAfter := resp.Header.Get("Retry-After")
+			if seconds, err := strconv.Atoi(retryAfter); err == nil {
+				log.Info("Rate limit reached. Retrying after delay.", "Seconds", seconds)
 				time.Sleep(time.Duration(seconds) * time.Second)
-				return service.doRequest(req) // Retry after the specified delay
+				continue
 			}
 		}
+
+		return resp, nil
 	}
 
-	return resp, nil
+	return nil, errors.New("monitor not found. cannot update")
 }
 
 // GetAll function will fetch all monitors
 func (service *StatusCakeMonitorService) GetAll() []models.Monitor {
+	// Return cached monitors if available
+	if len(cachedMonitors) > 0 {
+		log.Info("Returning cached monitors", "Count", len(cachedMonitors))
+		return cachedMonitors
+	}
+
 	var StatusCakeMonitorData []StatusCakeMonitorData
 	page := 1
+
 	for {
 		res := service.fetchMonitors(page)
 		if res != nil {
@@ -371,17 +435,22 @@ func (service *StatusCakeMonitorService) GetAll() []models.Monitor {
 				break
 			}
 		} else {
+			log.Error(errors.New("fetch monitors failed"), "Unable to fetch monitors from API")
 			return nil
 		}
-		page += 1
+		page++
 	}
-	return StatusCakeMonitorMonitorsToBaseMonitorsMapper(StatusCakeMonitorData)
+
+	// Map fetched monitors and update cache
+	cachedMonitors = StatusCakeMonitorMonitorsToBaseMonitorsMapper(StatusCakeMonitorData)
+	log.Info("Fetched and cached monitors", "Count", len(cachedMonitors))
+	return cachedMonitors
 }
 
 func (service *StatusCakeMonitorService) fetchMonitors(page int) *StatusCakeMonitor {
 	u, err := url.Parse(service.url)
 	if err != nil {
-		log.Error(err, "Unable to Parse monitor URL")
+		log.Error(err, "Unable to parse monitor URL")
 		return nil
 	}
 	u.Path = "/v1/uptime/"
@@ -390,9 +459,10 @@ func (service *StatusCakeMonitorService) fetchMonitors(page int) *StatusCakeMoni
 	query.Add("page", strconv.Itoa(page))
 	u.RawQuery = query.Encode()
 	u.Scheme = "https"
+
 	req, err := http.NewRequest("GET", u.String(), nil)
 	if err != nil {
-		log.Error(err, "Unable to retrieve monitor")
+		log.Error(err, "Unable to create HTTP request")
 		return nil
 	}
 	req.Header.Add("Authorization", fmt.Sprintf("Bearer %s", service.apiKey))
@@ -402,6 +472,7 @@ func (service *StatusCakeMonitorService) fetchMonitors(page int) *StatusCakeMoni
 		log.Error(err, "Unable to retrieve monitor")
 		return nil
 	}
+	defer resp.Body.Close()
 
 	bodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -410,23 +481,47 @@ func (service *StatusCakeMonitorService) fetchMonitors(page int) *StatusCakeMoni
 	}
 
 	if resp.StatusCode != http.StatusOK {
+		log.Error(errors.New("unexpected status code"), "StatusCode", resp.StatusCode)
 		return nil
 	}
-	var StatusCakeMonitor StatusCakeMonitor
-	err = json.Unmarshal(bodyBytes, &StatusCakeMonitor)
+
+	var statusCakeMonitor StatusCakeMonitor
+	err = json.Unmarshal(bodyBytes, &statusCakeMonitor)
 	if err != nil {
 		log.Error(err, "Failed to unmarshal response")
 		return nil
 	}
 
-	return &StatusCakeMonitor
+	// Debugging available fields
+	// for _, monitor := range statusCakeMonitor.StatusCakeData {
+	// 	log.Info("Monitor data", "Data", monitor)
+	// }
+
+	return &statusCakeMonitor
 }
 
 // Add will create a new Monitor
 func (service *StatusCakeMonitorService) Add(m models.Monitor) {
+	// Clear and repopulate cache
+	cachedMonitors = nil
+	service.GetAll()
+
+	log.Info("Attempting to add monitor", "Name", m.Name)
+
+	existingMonitor, err := service.GetByName(m.Name)
+	if err == nil && existingMonitor != nil {
+		if service.Equal(*existingMonitor, m) {
+			log.Info("monitor already up-to-date. skipping add operation.", "Name", m.Name)
+			return
+		}
+		log.Info("existing monitor found, but differences detected. updating monitor.", "Name", m.Name)
+		service.Update(m)
+		return
+	}
+
 	u, err := url.Parse(service.url)
 	if err != nil {
-		log.Error(err, "Unable to Parse monitor URL")
+		log.Error(err, "unable to parse monitor URL")
 		return
 	}
 	u.Path = "/v1/uptime"
@@ -434,33 +529,53 @@ func (service *StatusCakeMonitorService) Add(m models.Monitor) {
 	data := buildUpsertForm(m, service.cgroup)
 	req, err := http.NewRequest("POST", u.String(), bytes.NewBufferString(data.Encode()))
 	if err != nil {
-		log.Error(err, "Unable to create http request")
+		log.Error(err, "unable to create HTTP request")
 		return
 	}
 	req.Header.Add("Authorization", fmt.Sprintf("Bearer %s", service.apiKey))
 	resp, err := service.doRequest(req)
 	if err != nil {
-		log.Error(err, "Unable to make HTTP call")
+		log.Error(err, "unable to make HTTP call")
 		return
 	}
 	if resp.StatusCode == http.StatusCreated {
-		log.Info("Monitor Added: " + m.Name)
+		log.Info("monitor successfully added", "Name", m.Name)
 	} else {
-		bodyBytes, err := io.ReadAll(resp.Body)
-		if err != nil {
-			log.Error(err, "Unable to read response")
-			os.Exit(1)
-		}
-		log.Error(nil, "Insert Request failed for name: "+m.Name+" with status code "+strconv.Itoa(resp.StatusCode))
-		log.Error(nil, string(bodyBytes))
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		log.Error(errors.New("failed to add monitor"), "HTTP response error", "StatusCode", resp.StatusCode, "Body", string(bodyBytes))
 	}
 }
 
 // Update will update an existing Monitor
+// Update will update an existing Monitor
 func (service *StatusCakeMonitorService) Update(m models.Monitor) {
+	log.Info("Attempting to update monitor", "Name", m.Name)
+
+	// Retrieve the specific monitor by matching the name in the cache
+	var oldMonitor *models.Monitor
+	for _, cachedMonitor := range cachedMonitors {
+		if cachedMonitor.Name == m.Name {
+			oldMonitor = &cachedMonitor
+			break
+		}
+	}
+
+	if oldMonitor == nil {
+		log.Error(errors.New("monitor not found in cache"),
+			"Monitor not found for update", "Name", m.Name)
+		return
+	}
+
+	// Compare monitors to check if an update is needed
+	if service.Equal(*oldMonitor, m) {
+		log.Info("Monitor is already up-to-date. Skipping update operation.", "Name", m.Name)
+		return
+	}
+
+	// Perform the actual StatusCake PUT call...
 	u, err := url.Parse(service.url)
 	if err != nil {
-		log.Error(err, "Unable to Parse monitor URL")
+		log.Error(err, "Unable to parse monitor URL")
 		return
 	}
 	u.Path = fmt.Sprintf("/v1/uptime/%s", m.ID)
@@ -468,7 +583,7 @@ func (service *StatusCakeMonitorService) Update(m models.Monitor) {
 	data := buildUpsertForm(m, service.cgroup)
 	req, err := http.NewRequest("PUT", u.String(), bytes.NewBufferString(data.Encode()))
 	if err != nil {
-		log.Error(err, "Unable to create http request")
+		log.Error(err, "Unable to create HTTP request")
 		return
 	}
 	req.Header.Add("Authorization", fmt.Sprintf("Bearer %s", service.apiKey))
@@ -478,23 +593,32 @@ func (service *StatusCakeMonitorService) Update(m models.Monitor) {
 		return
 	}
 	if resp.StatusCode == http.StatusNoContent {
-		log.Info("Monitor Updated: " + m.ID + m.Name)
+		log.Info("Monitor successfully updated", "Name", m.Name)
+
+		// *** Force cache refresh so oldMonitor now has the new fields ***
+		cachedMonitors = nil
+		service.GetAll() // Re-populate the cache from StatusCake's actual data
+
 	} else {
-		bodyBytes, err := io.ReadAll(resp.Body)
-		if err != nil {
-			log.Error(err, "Unable to read response")
-			os.Exit(1)
-		}
-		log.Error(nil, "Update Request failed for name: "+m.Name+" with status code "+strconv.Itoa(resp.StatusCode))
-		log.Error(nil, string(bodyBytes))
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		log.Error(errors.New("failed to update monitor"),
+			"HTTP response error",
+			"StatusCode", resp.StatusCode,
+			"Body", string(bodyBytes))
 	}
 }
 
 // Remove will delete an existing Monitor
 func (service *StatusCakeMonitorService) Remove(m models.Monitor) {
+	// Clear and repopulate cache
+	cachedMonitors = nil
+	service.GetAll()
+
+	log.Info("Attempting to remove monitor", "Name", m.Name)
+
 	u, err := url.Parse(service.url)
 	if err != nil {
-		log.Error(err, "Unable to Parse monitor URL")
+		log.Error(err, "unable to parse monitor URL")
 		return
 	}
 	u.Path = fmt.Sprintf("/v1/uptime/%s", m.ID)
@@ -502,24 +626,23 @@ func (service *StatusCakeMonitorService) Remove(m models.Monitor) {
 
 	req, err := http.NewRequest("DELETE", u.String(), nil)
 	if err != nil {
-		log.Error(err, "Unable to create http request")
+		log.Error(err, "unable to create HTTP request")
 		return
 	}
 	req.Header.Add("Authorization", fmt.Sprintf("Bearer %s", service.apiKey))
 	resp, err := service.doRequest(req)
 	if err != nil {
-		log.Error(err, "Unable to make HTTP call")
+		log.Error(err, "unable to make HTTP call")
 		return
 	}
 	if resp.StatusCode != http.StatusNoContent {
-		log.Error(nil, fmt.Sprintf("Delete Request failed for Monitor: %s with id: %s", m.Name, m.ID))
-
+		log.Error(errors.New("failed to remove monitor"), "HTTP response error", "StatusCode", resp.StatusCode)
 	} else {
 		_, err = service.GetByID(m.ID)
-		if strings.Contains(err.Error(), "Request failed") {
-			log.Info("Monitor Deleted: " + m.ID + m.Name)
+		if strings.Contains(err.Error(), "request failed") {
+			log.Info("monitor successfully removed", "Name", m.Name)
 		} else {
-			log.Error(nil, fmt.Sprintf("Delete Request failed for Monitor: %s with id: %s", m.Name, m.ID))
+			log.Error(errors.New("delete request failed"), "Monitor", m.Name, "ID", m.ID)
 		}
 	}
 }
