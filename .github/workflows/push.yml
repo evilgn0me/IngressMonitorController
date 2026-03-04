@@ -189,7 +189,7 @@ jobs:
         branch: gh-pages
         repository: helm-charts
         target_dir: charts
-        token: ${{ secrets.GITHUB_TOKEN }}
+        token: ${{ secrets.HELM_CHARTS_TOKEN }}
         charts_dir: charts/
         charts_url: ${{ env.HELM_REGISTRY_URL }}
         owner: evilgn0me
