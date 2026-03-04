@@ -73,9 +73,8 @@ jobs:
       run: |
         kubectl cluster-info
         make install
-        # TODO: Create your own test config secret IMC_GITHUB_PIPELINE_CONFIG_ENCODED
-        # mkdir -p .local
-        # echo "${{ secrets.IMC_GITHUB_PIPELINE_CONFIG_ENCODED }}" | base64 --decode > .local/test-config.yaml
+        mkdir -p .local
+        echo "${{ secrets.IMC_GITHUB_PIPELINE_CONFIG_ENCODED }}" | base64 --decode > .local/test-config.yaml
 
     - name: Test
       run: make test
@@ -196,12 +195,12 @@ jobs:
         owner: evilgn0me
         linting: on
         commit_username: ${{ github.actor }}
-        commit_email: ${{ github.actor }}@users.noreply.github.com
+        commit_email: 7932965+evilgn0me@users.noreply.github.com
 
     # Commit back changes
     - name: Commit files
       run: |
-        git config --local user.email "action@github.com"
+        git config --local user.email "7932965+evilgn0me@users.noreply.github.com"
         git config --local user.name "github-actions"
         git status
         git add .
