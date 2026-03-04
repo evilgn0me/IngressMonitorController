@@ -1,11 +1,12 @@
 package config
 
 import (
-	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"reflect"
+	"testing"
+
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
-	"testing"
 )
 
 func init() {
@@ -108,10 +109,11 @@ func TestConfigWithUptime(t *testing.T) {
 func TestConfigWithAppinsights(t *testing.T) {
 
 	appinsightConfig := AppInsights{
-		Name:          "demo-appinsights",
-		Location:      "westeurope",
-		GeoLocation:   []interface{}{"us-tx-sn1-azr", "emea-nl-ams-azr", "us-fl-mia-edge", "latam-br-gru-edge"},
-		ResourceGroup: "demoRG",
+		Name:           "demo-appinsights",
+		SubscriptionId: "00000000-0000-0000-0000-000000000000",
+		Location:       "westeurope",
+		GeoLocation:    []interface{}{"us-tx-sn1-azr", "emea-nl-ams-azr", "us-fl-mia-edge", "latam-br-gru-edge"},
+		ResourceGroup:  "demoRG",
 		EmailAction: EmailAction{
 			SendToServiceOwners: false,
 			CustomEmails:        []*string{to.Ptr("mail@cizer.dev")},
