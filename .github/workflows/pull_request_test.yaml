@@ -53,8 +53,9 @@ jobs:
       run: |
         kubectl cluster-info
         make install
-        mkdir -p .local
-        echo "${{ secrets.IMC_GITHUB_PIPELINE_CONFIG_ENCODED }}" | base64 --decode > .local/test-config.yaml
+        # TODO: Create your own test config secret IMC_GITHUB_PIPELINE_CONFIG_ENCODED
+        # mkdir -p .local
+        # echo "${{ secrets.IMC_GITHUB_PIPELINE_CONFIG_ENCODED }}" | base64 --decode > .local/test-config.yaml
 
     - name: Test
       run: make test

@@ -18,9 +18,10 @@ env:
   KUSTOMIZE_VERSION: "5.4.3"
   KUBERNETES_VERSION: "1.23.5"
   KIND_VERSION: "v0.17.0"
-  HELM_REGISTRY_URL: "https://stakater.github.io/stakater-charts"
   HELM_VERSION: v3.8.2
   REGISTRY: ghcr.io
+  DOCKER_REPOSITORY: ghcr.io/evilgn0me/ingressmonitorcontroller
+  HELM_REGISTRY_URL: "https://evilgn0me.github.io/helm-charts"
 
 jobs:
   build:
@@ -72,8 +73,9 @@ jobs:
       run: |
         kubectl cluster-info
         make install
-        mkdir -p .local
-        echo "${{ secrets.IMC_GITHUB_PIPELINE_CONFIG_ENCODED }}" | base64 --decode > .local/test-config.yaml
+        # TODO: Create your own test config secret IMC_GITHUB_PIPELINE_CONFIG_ENCODED
+        # mkdir -p .local
+        # echo "${{ secrets.IMC_GITHUB_PIPELINE_CONFIG_ENCODED }}" | base64 --decode > .local/test-config.yaml
 
     - name: Test
       run: make test
@@ -95,46 +97,14 @@ jobs:
       with:
         buildkitd-flags: --debug
 
-    - name: Login to ghcr registry
+    - name: Login to GitHub Container Registry
       uses: docker/login-action@v3
       with:
-        registry: ${{env.REGISTRY}}
-        username: stakater-user
-        password: ${{secrets.GITHUB_TOKEN}}
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
 
-    - name: Generate image repository path for ghcr registry
-      run: |
-        echo GHCR_IMAGE_REPOSITORY=${{env.REGISTRY}}/$(echo ${{ github.repository }} | tr '[:upper:]' '[:lower:]') >> $GITHUB_ENV
-
-    - name: Build and Push image to ghcr registry
-      uses: docker/build-push-action@v6
-      with:
-        context: .
-        file: ${{ env.DOCKER_FILE_PATH  }}
-        pull: true
-        push: true
-        cache-to: type=inline
-        cache-from: type=gha
-        build-args: BUILD_PARAMETERS=${{ env.BUILD_PARAMETERS }}
-        platforms: linux/amd64,linux/arm,linux/arm64
-        tags: |
-          ${{ env.GHCR_IMAGE_REPOSITORY }}:${{ steps.generate_tag.outputs.new_tag }}
-        labels: |
-          org.opencontainers.image.source=${{ github.event.repository.clone_url }}
-          org.opencontainers.image.created=${{ steps.prep.outputs.created }}
-          org.opencontainers.image.revision=${{ github.sha }}
-
-    - name: Login to Dockerhub Registry
-      uses: docker/login-action@v3
-      with:
-        username: ${{ secrets.STAKATER_DOCKERHUB_USERNAME }}
-        password: ${{ secrets.STAKATER_DOCKERHUB_PASSWORD }}
-
-    - name: Generate image repository path for DockerHub registry
-      run: |
-        echo IMAGE_REPOSITORY=$(echo ${{ github.repository }} | tr '[:upper:]' '[:lower:]') >> $GITHUB_ENV
-
-    - name: Build and push image to DockerHub registry
+    - name: Build and push image to GHCR
       uses: docker/build-push-action@v6
       with:
         context: .
@@ -146,7 +116,8 @@ jobs:
         cache-to: type=gha,mode=max
         platforms: linux/amd64,linux/arm,linux/arm64
         tags: |
-          ${{ env.IMAGE_REPOSITORY }}:${{ steps.generate_tag.outputs.new_tag }}
+          ${{ env.DOCKER_REPOSITORY }}:${{ steps.generate_tag.outputs.new_tag }}
+          ${{ env.DOCKER_REPOSITORY }}:latest
         labels: |
           org.opencontainers.image.source=${{ github.event.repository.clone_url }}
           org.opencontainers.image.created=${{ steps.prep.outputs.created }}
@@ -161,7 +132,7 @@ jobs:
       id: generate_operator_tag
       uses: anothrNick/github-tag-action@1.61.0
       env:
-        GITHUB_TOKEN: ${{ secrets.PUBLISH_TOKEN }}
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         WITH_V: false
         DEFAULT_BUMP: patch
         DRY_RUN: true
@@ -182,7 +153,7 @@ jobs:
     - name: Generate Bundle
       env:
         VERSION: ${{ steps.generate_operator_tag.outputs.new_tag }}
-        IMG: ${{ env.IMAGE_REPOSITORY }}:${{ steps.generate_tag.outputs.new_tag }}
+        IMG: ${{ env.DOCKER_REPOSITORY }}:${{ steps.generate_tag.outputs.new_tag }}
       run: make bundle
 
     - name: Verify bundle
@@ -197,7 +168,7 @@ jobs:
         push: true
         cache-to: type=inline
         tags: |
-          ${{ env.IMAGE_REPOSITORY }}-bundle:${{ steps.generate_tag.outputs.new_tag }}
+          ${{ env.DOCKER_REPOSITORY }}-bundle:${{ steps.generate_tag.outputs.new_tag }}
         labels: |
           org.opencontainers.image.source=${{ github.event.repository.clone_url }}
           org.opencontainers.image.created=${{ steps.prep.outputs.created }}
@@ -216,22 +187,22 @@ jobs:
     - name: Publish Helm chart
       uses: stefanprodan/helm-gh-pages@master
       with:
-        branch: master
-        repository: stakater-charts
-        target_dir: docs
-        token: ${{ secrets.GHCR_TOKEN }}
+        branch: gh-pages
+        repository: helm-charts
+        target_dir: charts
+        token: ${{ secrets.GITHUB_TOKEN }}
         charts_dir: charts/
         charts_url: ${{ env.HELM_REGISTRY_URL }}
-        owner: stakater
+        owner: evilgn0me
         linting: on
-        commit_username: stakater-user
-        commit_email: stakater@gmail.com
+        commit_username: ${{ github.actor }}
+        commit_email: ${{ github.actor }}@users.noreply.github.com
 
     # Commit back changes
     - name: Commit files
       run: |
-        git config --local user.email "stakater@gmail.com"
-        git config --local user.name "stakater-user"
+        git config --local user.email "action@github.com"
+        git config --local user.name "github-actions"
         git status
         git add .
         git commit -m "[skip-ci] Update artifacts" -a
@@ -239,21 +210,12 @@ jobs:
     - name: Push changes
       uses: ad-m/github-push-action@master
       with:
-        github_token: ${{ secrets.PUBLISH_TOKEN }}
+        github_token: ${{ secrets.GITHUB_TOKEN }}
 
     # Push Latest Tag
     - name: Push Latest Tag
       uses: anothrNick/github-tag-action@1.61.0
       env:
-        GITHUB_TOKEN: ${{ secrets.PUBLISH_TOKEN }}
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         WITH_V: true
         DEFAULT_BUMP: patch
-
-    - name: Notify Slack
-      uses: 8398a7/action-slack@v3
-      if: always() # Pick up events even if the job fails or is canceled.
-      with:
-        status: ${{ job.status }}
-        fields: repo,author,action,eventName,ref,workflow
-      env:
-        SLACK_WEBHOOK_URL: ${{ secrets.STAKATER_DELIVERY_SLACK_WEBHOOK }}
