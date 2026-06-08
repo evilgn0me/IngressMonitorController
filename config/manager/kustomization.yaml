@@ -13,4 +13,4 @@ kind: Kustomization
 images:
 - name: controller
   newName: ghcr.io/evilgn0me/ingressmonitorcontroller
-  newTag: v0.0.1
+  newTag: v0.0.2

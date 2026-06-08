@@ -8,7 +8,7 @@ replicaCount: 1
 
 image:
   repository: ghcr.io/evilgn0me/ingressmonitorcontroller
-  tag: v0.0.1
+  tag: v0.0.2
   pullPolicy: IfNotPresent
 imagePullSecrets: []
 
