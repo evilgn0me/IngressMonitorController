@@ -74,6 +74,9 @@ jobs:
     name: Publish
     needs: [lint, build]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
     steps:
     - name: Check out code
       uses: actions/checkout@v4
