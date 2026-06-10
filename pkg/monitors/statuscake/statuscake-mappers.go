@@ -55,9 +55,13 @@ func StatusCakeApiResponseDataToBaseMonitorMapper(statuscakeData statuscake.Upti
 	if statuscakeData.Data.FindString != nil {
 		providerConfig.FindString = *statuscakeData.Data.FindString
 	}
+	seen := make(map[string]struct{})
 	var regionCodes []string
 	for _, server := range statuscakeData.Data.Servers {
-		regionCodes = append(regionCodes, server.RegionCode)
+		if _, ok := seen[server.RegionCode]; !ok {
+			seen[server.RegionCode] = struct{}{}
+			regionCodes = append(regionCodes, server.RegionCode)
+		}
 	}
 	providerConfig.Regions = strings.Join(regionCodes, ",")
 
