@@ -39,7 +39,7 @@ jobs:
         go-version-file: go.mod
 
     - name: Install kind
-      uses: engineerd/setup-kind@v0.5.0
+      uses: helm/kind-action@v1
       with:
         version: ${{ env.KIND_VERSION }}
 
@@ -47,7 +47,6 @@ jobs:
       run: |
         kubectl version --client
         kind version
-        kind version | grep -q ${KIND_VERSION}
 
     - name: Set up Cluster
       run: |

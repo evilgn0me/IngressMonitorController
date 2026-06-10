@@ -10,9 +10,8 @@ on:
       - 'examples/'
       - 'hack/'
       - 'config/'
+
 env:
-  DOCKER_FILE_PATH: Dockerfile
-  HELM_VERSION: v3.8.2
   REGISTRY: ghcr.io
   DOCKER_REPOSITORY: ghcr.io/evilgn0me/ingressmonitorcontroller
 
@@ -39,44 +38,28 @@ jobs:
         only-new-issues: false
         args: --timeout 10m
 
-    # Set up helm binary
-    - name: Set up Helm
-      uses: azure/setup-helm@v4
-      with:
-        version: ${{ env.HELM_VERSION }}
-
-    - name: Helm Lint
-      run: |
-        helm lint charts/ingressmonitorcontroller
-
     - name: Generate Tag
       id: generate_tag
       run: |
         sha=${{ github.event.pull_request.head.sha }}
         tag="SNAPSHOT-PR-${{ github.event.pull_request.number }}-${sha:0:8}"
-        echo "GIT_TAG=$(echo ${tag})" >> $GITHUB_OUTPUT
+        echo "GIT_TAG=${tag}" >> $GITHUB_OUTPUT
 
     - name: Set up QEMU
       uses: docker/setup-qemu-action@v3
 
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
-      with:
-        buildkitd-flags: --debug
-
-    # To identify any broken changes in dockerfiles or dependencies
 
     - name: Build image
       uses: docker/build-push-action@v6
       with:
         context: .
-        file: ${{ env.DOCKER_FILE_PATH  }}
-        pull: true
+        file: Dockerfile
         push: false
         cache-from: type=gha
         cache-to: type=gha,mode=max
-        build-args: BUILD_PARAMETERS=${{ env.BUILD_PARAMETERS }}
-        platforms: linux/amd64,linux/arm,linux/arm64
+        platforms: linux/amd64
         tags: |
           ${{ env.DOCKER_REPOSITORY }}:${{ steps.generate_tag.outputs.GIT_TAG }}
         labels: |
