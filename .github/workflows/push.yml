@@ -114,3 +114,30 @@ jobs:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         WITH_V: true
         DEFAULT_BUMP: patch
+
+  update-helm-chart:
+    name: Update Helm Chart
+    needs: [publish, build]
+    runs-on: ubuntu-latest
+    steps:
+    - name: Check out helm-charts repo
+      uses: actions/checkout@v4
+      with:
+        repository: evilgn0me/helm-charts
+        token: ${{ secrets.HELM_CHARTS_TOKEN }}
+
+    - name: Bump chart version and image tag
+      run: |
+        TAG=${{ needs.build.outputs.image_tag }}
+        VERSION=${TAG#v}
+        sed -i "s/^version:.*/version: ${VERSION}/" charts/ingressmonitorcontroller/Chart.yaml
+        sed -i "s/^appVersion:.*/appVersion: ${VERSION}/" charts/ingressmonitorcontroller/Chart.yaml
+        sed -i "s/^\([[:space:]]*tag:\).*/\1 ${TAG}/" charts/ingressmonitorcontroller/values.yaml
+
+    - name: Commit and push
+      run: |
+        git config user.name "github-actions"
+        git config user.email "github-actions@github.com"
+        git add charts/ingressmonitorcontroller/Chart.yaml charts/ingressmonitorcontroller/values.yaml
+        git diff --staged --quiet || git commit -m "chore: bump ingressmonitorcontroller to ${{ needs.build.outputs.image_tag }}"
+        git push
