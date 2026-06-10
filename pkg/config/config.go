@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"strconv"
 	"time"
@@ -101,17 +102,18 @@ type WebhookAction struct {
 	ServiceURI string `yaml:"service_uri"`
 }
 
-func LoadControllerConfig(apiReader client.Reader) {
+// LoadControllerConfig loads the controller configuration from the imc-config
+// secret. It returns an error if the secret is missing or invalid; callers
+// should log the error and retry rather than crashing.
+func LoadControllerConfig(apiReader client.Reader) error {
 	var config Config
 	log.Info("Loading YAML Configuration from secret")
 
-	// Retrieve operator namespace
 	operatorNamespace, _ := os.LookupEnv("OPERATOR_NAMESPACE")
 	if len(operatorNamespace) == 0 {
 		operatorNamespaceTemp, err := util.GetOperatorNamespace()
 		if err != nil {
-			log.Error(err, "Unable to get operator namespace")
-			panic("Unable to get operator namespace")
+			return fmt.Errorf("unable to get operator namespace: %w", err)
 		}
 		operatorNamespace = operatorNamespaceTemp
 	}
@@ -122,18 +124,17 @@ func LoadControllerConfig(apiReader client.Reader) {
 		log.Info("CONFIG_SECRET_NAME is unset, using default value: imc-config")
 	}
 
-	// Retrieve config key from secret
 	configKey, err := secret.LoadSecretData(apiReader, configSecretName, operatorNamespace, IngressMonitorControllerSecretConfigKey)
 	if err != nil {
-		panic(err)
+		return fmt.Errorf("secret %q not found or unreadable: %w", configSecretName, err)
 	}
 
-	// Unmarshall
-	err = yaml.Unmarshal([]byte(configKey), &config)
-	if err != nil {
-		panic(err)
+	if err = yaml.Unmarshal([]byte(configKey), &config); err != nil {
+		return fmt.Errorf("failed to unmarshal config from secret %q: %w", configSecretName, err)
 	}
+
 	IngressMonitorControllerConfig = config
+	return nil
 }
 
 func GetControllerConfig() Config {

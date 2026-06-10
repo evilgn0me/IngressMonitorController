@@ -255,18 +255,17 @@ func buildUpsertForm(m models.Monitor, cgroup string) url.Values {
 	if providerConfig != nil && len(providerConfig.BasicAuthSecret) > 0 {
 		k8sClient, err := kube.GetClient()
 		if err != nil {
-			panic(err)
-		}
-
-		namespace := kube.GetCurrentKubernetesNamespace()
-		username, password, err := secret.ReadBasicAuthSecret(k8sClient.CoreV1().Secrets(namespace), providerConfig.BasicAuthSecret)
-
-		if err != nil {
-			log.Error(err, "Could not read the secret")
+			log.Error(err, "Could not get Kubernetes client for BasicAuthSecret, skipping basic auth")
 		} else {
-			f.Add("basic_username", username)
-			f.Add("basic_password", password)
-			log.Info("Basic auth requirement detected. Setting username and password")
+			namespace := kube.GetCurrentKubernetesNamespace()
+			username, password, err := secret.ReadBasicAuthSecret(k8sClient.CoreV1().Secrets(namespace), providerConfig.BasicAuthSecret)
+			if err != nil {
+				log.Error(err, "Could not read the secret")
+			} else {
+				f.Add("basic_username", username)
+				f.Add("basic_password", password)
+				log.Info("Basic auth requirement detected. Setting username and password")
+			}
 		}
 	}
 
@@ -557,23 +556,60 @@ func (service *StatusCakeMonitorService) GetByID(id string) (*models.Monitor, er
 	return nil, errors.New("empty response from statusCake")
 }
 
-// doRequest function with smarter rate limiting for multiple controllers
+const maxDoRequestRetries = 3
+
+// doRequest buffers the request body (so retries can replay it) then delegates
+// to doRequestRetry starting at attempt 0.
 func (service *StatusCakeMonitorService) doRequest(req *http.Request) (*http.Response, error) {
-	// Use a context with timeout to prevent hanging connections
-	ctx, cancel := context.WithTimeout(req.Context(), 30*time.Second)
+	var bodyBytes []byte
+	if req.Body != nil {
+		var err error
+		bodyBytes, err = io.ReadAll(req.Body)
+		req.Body.Close()
+		if err != nil {
+			return nil, fmt.Errorf("reading request body: %w", err)
+		}
+		req.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+	}
+	return service.doRequestRetry(req, bodyBytes, 0)
+}
+
+// cloneRequest creates a new *http.Request with the same method, URL, headers,
+// and the supplied body bytes.
+func (service *StatusCakeMonitorService) cloneRequest(req *http.Request, bodyBytes []byte) (*http.Request, error) {
+	var body io.Reader
+	if len(bodyBytes) > 0 {
+		body = bytes.NewBuffer(bodyBytes)
+	}
+	newReq, err := http.NewRequest(req.Method, req.URL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+	for name, values := range req.Header {
+		for _, value := range values {
+			newReq.Header.Add(name, value)
+		}
+	}
+	return newReq, nil
+}
+
+// doRequestRetry is the internal retry loop with a hard attempt cap.
+func (service *StatusCakeMonitorService) doRequestRetry(req *http.Request, bodyBytes []byte, attempt int) (*http.Response, error) {
+	if attempt >= maxDoRequestRetries {
+		return nil, fmt.Errorf("max retries (%d) exceeded for %s %s", maxDoRequestRetries, req.Method, req.URL.Path)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	req = req.WithContext(ctx)
 
-	// Add jitter to prevent controllers from syncing up
 	jitter := time.Duration(rand.Intn(1000)) * time.Millisecond
 	time.Sleep(jitter)
 
-	// Set content-type header for POST and PUT requests if not already set
 	if (req.Method == "POST" || req.Method == "PUT") && req.Header.Get("Content-Type") == "" {
 		req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
 	}
 
-	// Add a unique identifier to help with debugging across instances
 	instanceID := fmt.Sprintf("%d", time.Now().UnixNano()%10000)
 	req.Header.Add("X-Instance-ID", instanceID)
 
@@ -586,79 +622,57 @@ func (service *StatusCakeMonitorService) doRequest(req *http.Request) (*http.Res
 		return nil, err
 	}
 
-	// Handle 429 Too Many Requests with a proper retry based on headers
 	if resp.StatusCode == http.StatusTooManyRequests {
 		resp.Body.Close()
 
 		resetTime := 5 * time.Second
-		// Parse x-ratelimit-reset header
 		if reset := resp.Header.Get("x-ratelimit-reset"); reset != "" {
 			if seconds, err := strconv.Atoi(reset); err == nil && seconds > 0 {
 				resetTime = time.Duration(seconds+1) * time.Second
 			}
 		}
 
-		// Only log rate limits at higher verbosity level
 		log.V(1).Info("Rate limit exceeded, waiting to retry",
 			"method", req.Method,
 			"path", req.URL.Path,
-			"resetSeconds", resetTime.Seconds())
+			"resetSeconds", resetTime.Seconds(),
+			"attempt", attempt)
 
-		// Sleep for the reset duration + jitter
 		time.Sleep(resetTime + jitter)
 
-		newReq, err := http.NewRequest(req.Method, req.URL.String(), nil)
+		newReq, err := service.cloneRequest(req, bodyBytes)
 		if err != nil {
 			return nil, err
 		}
-		for name, values := range req.Header {
-			for _, value := range values {
-				newReq.Header.Add(name, value)
-			}
-		}
-		return service.doRequest(newReq)
+		return service.doRequestRetry(newReq, bodyBytes, attempt+1)
 	}
 
-	// Check for any other problematic responses
 	if resp.StatusCode != http.StatusOK &&
 		resp.StatusCode != http.StatusCreated &&
 		resp.StatusCode != http.StatusNoContent {
 
-		// Get response body for logging purposes
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		resp.Body.Close() // Close this response
+		respBodyBytes, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
 
-		sleepTime := backoffTime
-
+		sleepTime := backoffTime + jitter
 		log.Info("API error encountered, backing off",
 			"status", resp.StatusCode,
 			"method", req.Method,
 			"url", req.URL.String(),
-			"body", string(bodyBytes),
+			"body", string(respBodyBytes),
 			"seconds", sleepTime.Seconds(),
+			"attempt", attempt,
 			"instanceID", instanceID)
 
-		// Sleep and retry with exponential backoff
-		sleepTime = sleepTime + jitter
 		time.Sleep(sleepTime)
 
-		// Create a new request since we've consumed the body
-		newReq, err := http.NewRequest(req.Method, req.URL.String(), nil)
+		newReq, err := service.cloneRequest(req, bodyBytes)
 		if err != nil {
 			return nil, err
 		}
-
-		// Copy headers
-		for name, values := range req.Header {
-			for _, value := range values {
-				newReq.Header.Add(name, value)
-			}
-		}
-
-		return service.doRequest(newReq) // Retry after backoff
+		return service.doRequestRetry(newReq, bodyBytes, attempt+1)
 	}
 
-	// Check remaining rate limit and slow down if needed
 	if remaining := resp.Header.Get("x-ratelimit-remaining"); remaining != "" {
 		if rem, err := strconv.Atoi(remaining); err == nil && rem <= 1 {
 			if reset := resp.Header.Get("x-ratelimit-reset"); reset != "" {
@@ -667,50 +681,37 @@ func (service *StatusCakeMonitorService) doRequest(req *http.Request) (*http.Res
 						"method", req.Method,
 						"remaining", remaining,
 						"resetSeconds", seconds)
-
 					time.Sleep(500 * time.Millisecond)
 				}
 			}
 		}
 	}
 
-	// Even with "successful" responses, check if body is empty and retry if so
-	bodyBytes, err := io.ReadAll(resp.Body)
+	respBodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
 		resp.Body.Close()
 		log.Error(err, "Unable to read response body")
 		return nil, err
 	}
 
-	// Create a new response with the same data but with a ReadCloser body
 	newResp := *resp
-	newResp.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+	newResp.Body = io.NopCloser(bytes.NewBuffer(respBodyBytes))
 
-	// Empty response with 200 status might indicate rate limiting
-	if len(bodyBytes) == 0 && (resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated) {
+	if len(respBodyBytes) == 0 && (resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated) {
 		log.V(1).Info("Empty body received with success status code - possible rate limiting",
 			"method", req.Method,
 			"url", req.URL.String(),
 			"status", resp.StatusCode,
+			"attempt", attempt,
 			"instanceID", instanceID)
 
-		// Wait before retry
 		time.Sleep(3*time.Second + jitter)
 
-		// Create new request for retry
-		newReq, err := http.NewRequest(req.Method, req.URL.String(), nil)
+		newReq, err := service.cloneRequest(req, bodyBytes)
 		if err != nil {
-			return &newResp, nil // Return the empty response if new request can't be created
+			return &newResp, nil
 		}
-
-		// Copy headers
-		for name, values := range req.Header {
-			for _, value := range values {
-				newReq.Header.Add(name, value)
-			}
-		}
-
-		return service.doRequest(newReq) // Retry after backoff
+		return service.doRequestRetry(newReq, bodyBytes, attempt+1)
 	}
 
 	return &newResp, nil
@@ -728,14 +729,23 @@ func (service *StatusCakeMonitorService) GetAll() []models.Monitor {
 		return monitors
 	}
 
-	// If allMonitors was cleared but monitorCache has data, rebuild from monitorCache
+	// If allMonitors was cleared but monitorCache has data, rebuild from monitorCache.
+	// monitorCache is keyed by both ID and Name, so deduplicate by ID.
 	if len(service.monitorCache) > 0 &&
 		len(service.allMonitors) == 0 {
 
 		log.V(1).Info("Rebuilding monitor list from cache", "cacheSize", len(service.monitorCache))
-		monitors := make([]models.Monitor, 0, len(service.monitorCache))
+		seen := make(map[string]bool, len(service.monitorCache)/2)
+		monitors := make([]models.Monitor, 0, len(service.monitorCache)/2)
 		for _, m := range service.monitorCache {
-			monitors = append(monitors, *m)
+			key := m.ID
+			if key == "" {
+				key = m.Name
+			}
+			if !seen[key] {
+				seen[key] = true
+				monitors = append(monitors, *m)
+			}
 		}
 
 		service.allMonitors = monitors
@@ -841,7 +851,7 @@ func (service *StatusCakeMonitorService) fetchAllMonitors() []models.Monitor {
 
 	// Step 2: Prepare for efficient detailed data loading
 	var completeMonitors []models.Monitor
-	var mutex sync.Mutex
+	var mu sync.Mutex // protects completeMonitors slice only
 
 	// Create a semaphore to limit concurrent API requests
 	semaphore := make(chan struct{}, 5) // Max 5 concurrent requests
@@ -859,7 +869,6 @@ func (service *StatusCakeMonitorService) fetchAllMonitors() []models.Monitor {
 			semaphore <- struct{}{}
 			defer func() { <-semaphore }()
 
-			// Fetch detailed monitor data
 			u, err := url.Parse(service.url)
 			if err != nil {
 				log.Error(err, "Unable to parse URL", "monitorID", monitorID)
@@ -876,7 +885,6 @@ func (service *StatusCakeMonitorService) fetchAllMonitors() []models.Monitor {
 			}
 			req.Header.Add("Authorization", fmt.Sprintf("Bearer %s", service.apiKey))
 
-			// Use doRequest instead of direct client.Do to properly handle rate limits
 			resp, err := service.doRequest(req)
 			if err != nil {
 				log.Error(err, "HTTP request failed", "monitorID", monitorID)
@@ -897,16 +905,16 @@ func (service *StatusCakeMonitorService) fetchAllMonitors() []models.Monitor {
 
 			detailedMonitor := StatusCakeApiResponseDataToBaseMonitorMapper(data)
 
-			// THIS IS THE KEY PART THAT'S MISSING:
-			// Add the detailed monitor to our results collection
-			mutex.Lock()
-			completeMonitors = append(completeMonitors, *detailedMonitor)
+			service.cacheLock.Lock()
 			service.monitorCache[monitorID] = detailedMonitor
-			mutex.Unlock()
+			service.cacheLock.Unlock()
+
+			mu.Lock()
+			completeMonitors = append(completeMonitors, *detailedMonitor)
+			mu.Unlock()
 		}(id)
 
-		// Larger delay between starting goroutines when multiple instances share API key
-		time.Sleep(100 * time.Millisecond) // Increased from 50ms
+		time.Sleep(100 * time.Millisecond)
 	}
 
 	// Wait for all fetches to complete
@@ -927,10 +935,9 @@ func (service *StatusCakeMonitorService) fetchAllMonitors() []models.Monitor {
 			log.Info("Using basic data as fallback for monitor", "id", id, "name", basicMonitor.Name)
 			completeMonitors = append(completeMonitors, basicMonitor)
 
-			// Also cache it
-			mutex.Lock()
+			service.cacheLock.Lock()
 			service.monitorCache[id] = &basicMonitor
-			mutex.Unlock()
+			service.cacheLock.Unlock()
 		}
 	}
 
@@ -1095,7 +1102,7 @@ func (service *StatusCakeMonitorService) Update(m models.Monitor) {
 		bodyBytes, err := io.ReadAll(resp.Body)
 		if err != nil {
 			log.Error(err, "Unable to read response")
-			os.Exit(1)
+			return
 		}
 		log.Error(nil, "Update Request failed for name: "+m.Name+" with status code "+strconv.Itoa(resp.StatusCode))
 		log.Error(nil, string(bodyBytes))
@@ -1154,9 +1161,10 @@ func (service *StatusCakeMonitorService) Remove(m models.Monitor) {
 			"id", m.ID,
 			"body", string(bodyBytes),
 		)
+		return
 	}
 
-	// 3) Remove from cache regardless of API response
+	// 3) Remove from cache only after confirmed API deletion
 	service.cacheLock.Lock()
 	defer service.cacheLock.Unlock()
 

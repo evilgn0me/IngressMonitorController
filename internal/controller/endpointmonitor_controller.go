@@ -43,6 +43,7 @@ type EndpointMonitorReconciler struct {
 	client.Client
 	Log             logr.Logger
 	Scheme          *runtime.Scheme
+	APIReader       client.Reader
 	MonitorServices []*monitors.MonitorServiceProxy
 }
 
@@ -54,10 +55,28 @@ type EndpointMonitorReconciler struct {
 //+kubebuilder:rbac:groups="",resources=services,verbs=get;list
 //+kubebuilder:rbac:groups="",resources=pods,verbs=get;list
 
+// configRetryInterval is how long to wait before re-checking for the imc-config secret.
+const configRetryInterval = 30 * time.Second
+
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
 func (r *EndpointMonitorReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := r.Log.WithValues("endpointmonitor", req.NamespacedName)
+
+	// If no providers are configured, the imc-config secret is not yet available.
+	// Try to load it and requeue if still missing.
+	if len(r.MonitorServices) == 0 {
+		if err := config.LoadControllerConfig(r.APIReader); err != nil {
+			log.Info("imc-config not yet available, requeuing", "error", err)
+			return reconcile.Result{RequeueAfter: configRetryInterval}, nil
+		}
+		r.MonitorServices = monitors.SetupMonitorServicesForProviders(config.GetControllerConfig().Providers)
+		if len(r.MonitorServices) == 0 {
+			log.Info("imc-config loaded but contains no providers, requeuing")
+			return reconcile.Result{RequeueAfter: configRetryInterval}, nil
+		}
+		log.Info("imc-config loaded successfully", "providers", len(r.MonitorServices))
+	}
 
 	// Fetch the EndpointMonitor instance
 	instance := &endpointmonitorv1alpha1.EndpointMonitor{}
@@ -88,6 +107,10 @@ func (r *EndpointMonitorReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	delay := time.Until(createTime.Add(config.GetControllerConfig().CreationDelay))
 
 	monitorService := r.GetMonitorOfType(instance.Spec)
+	if monitorService == nil {
+		log.Info("No matching monitor service found for spec, skipping", "name", monitorName)
+		return reconcile.Result{RequeueAfter: config.ReconciliationRequeueTime}, nil
+	}
 	monitor := findMonitorByName(monitorService, monitorName)
 	if monitor != nil {
 		// Monitor already exists, update if required
@@ -116,7 +139,7 @@ func (r *EndpointMonitorReconciler) SetupWithManager(mgr ctrl.Manager, maxConcur
 
 func (r *EndpointMonitorReconciler) GetMonitorOfType(spec endpointmonitorv1alpha1.EndpointMonitorSpec) *monitors.MonitorServiceProxy {
 	if len(r.MonitorServices) == 0 {
-		panic("No monitor services found")
+		return nil
 	}
 	if spec.PingdomTransactionConfig != nil {
 		return r.GetMonitorServiceOfType(monitors.TypePingdomTransaction)

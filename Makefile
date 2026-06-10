@@ -90,8 +90,9 @@ help: ## Display this help.
 manifests: controller-gen ## Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects.
     $(CONTROLLER_GEN) rbac:roleName=manager-role crd webhook paths="./..." output:crd:artifacts:config=config/crd/bases
 
-generate: controller-gen ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
-	$(CONTROLLER_GEN) object:headerFile="hack/boilerplate.go.txt" paths="./..."
+generate: controller-gen ## Generate code containing DeepCopy, etc.
+    $(CONTROLLER_GEN) object:headerFile="hack/boilerplate.go.txt" \
+        paths="$$(go list ./... | grep -v 'pkg/monitors/statuscake')"
 
 fmt: ## Run go fmt against code.
 	go fmt ./...
@@ -105,7 +106,6 @@ ENVTEST_K8S_VERSION = 1.31.0
 test: generate fmt vet manifests envtest
 	$(ENVTEST) use -p path 1.28.x!
 	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test ./... -coverprofile cover.out,
-
 
 ##@ Build
 

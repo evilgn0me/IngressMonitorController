@@ -168,15 +168,20 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Load Controller Config
-	config.LoadControllerConfig(mgr.GetAPIReader())
-	config := config.GetControllerConfig()
+	// Load Controller Config — non-fatal: the reconciler will retry on every
+	// reconcile loop until the imc-config secret becomes available.
+	apiReader := mgr.GetAPIReader()
+	if err := config.LoadControllerConfig(apiReader); err != nil {
+		setupLog.Info("imc-config not available at startup, will retry in reconcile loop", "error", err)
+	}
+	cfg := config.GetControllerConfig()
 
 	if err = (&controllers.EndpointMonitorReconciler{
 		Client:          mgr.GetClient(),
 		Log:             ctrl.Log.WithName("controllers").WithName("EndpointMonitor"),
 		Scheme:          mgr.GetScheme(),
-		MonitorServices: monitors.SetupMonitorServicesForProviders(config.Providers),
+		APIReader:       apiReader,
+		MonitorServices: monitors.SetupMonitorServicesForProviders(cfg.Providers),
 	}).SetupWithManager(mgr, maxConcurrentReconciles); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "EndpointMonitor")
 		os.Exit(1)
