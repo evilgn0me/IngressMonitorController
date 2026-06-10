@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -150,7 +151,7 @@ func (monitor *StatusCakeMonitorService) Equal(oldMonitor models.Monitor, newMon
 		hasDifferences = true
 	}
 
-	if oldConfig.Regions != newConfig.Regions {
+	if normalizeRegions(oldConfig.Regions) != normalizeRegions(newConfig.Regions) {
 		differences = append(differences, fmt.Sprintf("Regions: %v -> %v", oldConfig.Regions, newConfig.Regions))
 		hasDifferences = true
 	}
@@ -404,6 +405,20 @@ func convertUrlValuesToString(vals url.Values, key string) string {
 func convertStringToArray(stringValues string) []string {
 	stringArray := strings.Split(stringValues, ",")
 	return stringArray
+}
+
+// normalizeRegions sorts a comma-separated region string so that Equal comparisons
+// are not sensitive to the order in which the API returns server locations.
+func normalizeRegions(regions string) string {
+	if regions == "" {
+		return ""
+	}
+	parts := strings.Split(regions, ",")
+	for i, p := range parts {
+		parts[i] = strings.TrimSpace(p)
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, ",")
 }
 
 // Setup function is used to initialise the StatusCake service
